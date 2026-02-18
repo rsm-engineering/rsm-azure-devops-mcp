@@ -1,270 +1,204 @@
 # Troubleshooting
 
-To help you troubleshoot and debug issues, try adding the `LOG_LEVEL` to your `mcp.json`
+## Deployment Issues
 
-Example
+### Deploy script exits with no output
 
-```json
-{
-  "inputs": [
-    {
-      "id": "ado_org",
-      "type": "promptString",
-      "description": "Azure DevOps organization name  (e.g. 'contoso')"
-    }
-  ],
-  "servers": {
-    "ado": {
-      "type": "stdio",
-      "command": "mcp-server-azuredevops",
-      "args": ["${input:ado_org}"],
-      "env": {
-        "LOG_LEVEL": "debug"
-      }
-    }
-  }
-}
+**Symptom:** `bash deploy/deploy.sh` exits with code 1 and no output.
+
+**Solution:** Run the deployment steps individually to identify which step fails:
+
+```bash
+source deploy/config.sh
+
+# Test each step
+az group create --name $RESOURCE_GROUP --location $LOCATION
+az acr create --resource-group $RESOURCE_GROUP --name $ACR_NAME --sku Basic
+# ... continue with each step from deploy.sh
 ```
 
-## Common MCP Issues
+### Key Vault name already taken
 
-1. **Clearing VS Code Cache**
-   If you encounter issues with stale configurations, reload the VS Code window:
-   - Press `Ctrl+Shift+P` (or `Cmd+Shift+P` on macOS).
-   - Select `Developer: Reload Window`.
+**Symptom:** `az keyvault create` fails with "VaultAlreadyExists" or similar.
 
-   If the issue persists, you can take a more aggressive approach by clearing the following folders:
-   - `%APPDATA%\Code\Cache`
-   - `%APPDATA%\Code\CachedData`
-   - `%APPDATA%\Code\User\workspaceStorage`
-   - `%APPDATA%\Code\logs`
+**Solution:** Key Vault names are globally unique. Edit `KEY_VAULT_NAME` in `deploy/config.sh` to use a unique name, then re-run the deployment.
 
-   Clear Node Modules Cache
-   - `npm cache clean --force`
+### MSYS path mangling on Windows (Git Bash)
 
-2. **Server Not Showing Up in Agent Mode**
-   Ensure that the `mcp.json` file is correctly configured and includes the appropriate server definitions. Restart your MCP server and reload the VS Code window.
+**Symptom:** `az role assignment create` fails because `--scope /subscriptions/...` gets converted to `C:/Program Files/Git/subscriptions/...`.
 
-3. **Tools Not Loading in Agent Mode**
-   If tools do not appear, click "Add Context" in Agent Mode and ensure all tools starting with `ado_` are selected.
+**Solution:** The deploy script already includes `MSYS_NO_PATHCONV=1` for the role assignment command. If you're running commands manually in Git Bash, prefix them:
 
-4. **Too Many Tools Selected (Over 128 Limit)**
-   Some tools have a default maximum limot of 128 tools. If you exceed this limit, ensure you do not have multiple MCP Servers running. Check both your project's `mcp.json` and your VS Code `settings.json` to confirm that the MCP Server is configured in only one location—not both.
+```bash
+MSYS_NO_PATHCONV=1 az role assignment create --scope /subscriptions/...
+```
 
-   You can also use [Domains](../README.md?tab=readme-ov-file#-using-domains) as a way to limit the number of tools you load for the Azure DevOps MCP Server.
+### Container App fails to start
 
-## Project-Specific Issues
+**Symptom:** Container App is in a failed state or `/healthz` returns errors.
 
-1. **npm Authentication Issues for Remote Access**
-   If you encounter authentication errors:
-   - Verify your npm configuration:
-
-     ```pwsh
-     npm config get registry
-     ```
-
-     It should point to: `https://registry.npmjs.org/`
-
-2. **Dependency Installation Errors**
-   If `npm install` fails, verify that you are using Node.js version 20 or higher. You can check your Node.js version with:
-
-   ```pwsh
-   node -v
+**Solutions:**
+1. Check container logs:
+   ```bash
+   az containerapp logs show --name ado-mcp-server --resource-group rg-ado-mcp --type console
    ```
+2. Verify environment variables are set:
+   ```bash
+   az containerapp show --name ado-mcp-server --resource-group rg-ado-mcp --query "properties.template.containers[0].env"
+   ```
+3. Ensure `AZURE_KEYVAULT_URL` points to a valid Key Vault URL (e.g., `https://kv-rsm-ado-mcp.vault.azure.net/`).
+
+### ACR build fails
+
+**Symptom:** `az acr build` fails during Docker image build.
+
+**Solutions:**
+1. Verify the Dockerfile exists in the project root.
+2. Check that the ACR name in `deploy/config.sh` matches the actual ACR.
+3. Ensure you're logged in: `az acr login --name <ACR_NAME>`.
 
 ## Authentication Issues
 
-### Token Authentication via Environment Variables
+### 401 Unauthorized on `/mcp`
 
-For automated scenarios or when you want to use a token stored in an environment variable, you can use the `envvar` authentication type:
+**Possible causes:**
 
-1. **Set your token in the ADO_MCP_AUTH_TOKEN environment variable:**
+1. **Invalid or missing API key:** Ensure the `x-api-key` header contains the correct `rsmk_...` key returned during user registration.
+2. **Invalid Bearer token:** If sending an `Authorization: Bearer` header, the AAD token must be valid. An invalid Bearer token returns 401 without falling back to API key.
+3. **User not registered:** The API key doesn't match any user in Key Vault. Re-register the user via the admin API.
 
+### 403 Forbidden — "User is not registered"
+
+**Symptom:** `POST /mcp` returns `User 'email@example.com' is not registered. Contact an admin.`
+
+**Solution:** The authenticated user (resolved from API key or AAD token) doesn't have a Key Vault secret. Register them:
+
+```bash
+curl -X POST https://<FQDN>/admin/users \
+  -H "x-api-key: $ADMIN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"email": "email@example.com", "org": "MyOrg", "url": "https://dev.azure.com/MyOrg", "pat": "<PAT>"}'
+```
+
+### 403 Forbidden — "Session belongs to another user"
+
+**Symptom:** Requests with `mcp-session-id` header return "Session belongs to another user."
+
+**Cause:** The session was created by a different user. Session ownership is enforced on every request.
+
+**Solution:** Each user must use their own session. Do not share `mcp-session-id` values between users. Start a new session by sending an `initialize` request without the `mcp-session-id` header.
+
+### Admin API returns 401
+
+**Symptom:** Admin endpoints (`/admin/users`) return 401.
+
+**Solution:** Ensure you're sending the correct `ADMIN_API_KEY` in the `x-api-key` header. This is the key set during deployment, not a user API key.
+
+## Key Vault Issues
+
+### "Access denied" or "Forbidden" from Key Vault
+
+**Symptom:** Server logs show Key Vault access errors.
+
+**Solutions:**
+
+1. Verify the Container App's Managed Identity has the "Key Vault Secrets Officer" role:
    ```bash
-   export ADO_MCP_AUTH_TOKEN="your-azure-devops-token"
+   PRINCIPAL_ID=$(az containerapp show --name ado-mcp-server --resource-group rg-ado-mcp --query "identity.principalId" -o tsv)
+   az role assignment list --assignee $PRINCIPAL_ID --scope $(az keyvault show --name kv-rsm-ado-mcp --query id -o tsv)
    ```
 
-2. **Use the envvar authentication type:**
-
+2. If the role is missing, add it:
    ```bash
-   npx @azure-devops/mcp myorg --authentication envvar
+   KV_ID=$(az keyvault show --name kv-rsm-ado-mcp --query id -o tsv)
+   MSYS_NO_PATHCONV=1 az role assignment create \
+     --role "Key Vault Secrets Officer" \
+     --assignee-object-id $PRINCIPAL_ID \
+     --assignee-principal-type ServicePrincipal \
+     --scope $KV_ID
    ```
 
-3. **For MCP configuration files, update your `.vscode/mcp.json`:**
-   ```json
-   {
-     "inputs": [
-       {
-         "id": "ado_org",
-         "type": "promptString",
-         "description": "Azure DevOps organization name (e.g. 'contoso')"
-       }
-     ],
-     "servers": {
-       "ado": {
-         "type": "stdio",
-         "command": "npx",
-         "args": ["-y", "@azure-devops/mcp", "${input:ado_org}", "--authentication", "envvar"]
-       }
-     }
-   }
+3. Ensure the Key Vault uses **RBAC** authorization (not access policies):
+   ```bash
+   az keyvault show --name kv-rsm-ado-mcp --query "properties.enableRbacAuthorization"
    ```
 
-### GitHub Codespaces
+### User config cache is stale
 
-Due to limitations of the environment default OAuth option is not available in Codespace.
-Make sure you authenticate via
+**Symptom:** After updating a user's config in Key Vault, the old config is still used.
 
-```sh
-az login
+**Solution:** User configs are cached in-memory for 5 minutes. Wait for the cache to expire, or restart the Container App:
+
+```bash
+az containerapp revision restart --name ado-mcp-server --resource-group rg-ado-mcp --revision <REVISION_NAME>
 ```
 
-in the terminal before using MCP tools.
+## Azure DevOps API Issues
 
-And in case there are authorization/access errors when using the tools please check the [Multi-Tenant Authentication Problems guide](#multi-tenant-authentication-problems-when-using-azcli)
+### "Failed to find api location" error
 
-### OAuth
+**Symptom:** Tool calls return `Failed to find api location for area: Location id: ...`
 
-Recent switch to OAuth flow is supposed to simplify authentication against ADO APIs and remove additional software dependency.
+**Cause:** The Azure DevOps organization name or URL is incorrect.
 
-It is however possible that strict tenant admin policies prevent users from successfully logging in using OAuth flow. In that case consider falling back to AZ CLI.
+**Solution:** Verify the user's registration has the correct `org` and `url` values. The `url` should be the full URL (e.g., `https://dev.azure.com/MyOrg`).
 
-#### Symptoms
+### Search tools fail with 401/403
 
-Upon ADO tool execution browser opens a tab/window and after login attempt an error text is displayed:
+**Symptom:** `search_code`, `search_wiki`, or `search_workitem` return authentication errors.
 
+**Cause:** The user's PAT doesn't have the required scopes.
+
+**Solution:** Ensure the PAT has these read scopes:
+- **Code (Read)** — for `search_code`
+- **Wiki (Read)** — for `search_wiki`
+- **Work Items (Read)** — for `search_workitem`
+
+### `core_get_identity_ids` fails
+
+**Symptom:** Returns "No identities found" or access error.
+
+**Cause:** The PAT may lack the Identity (Read) scope, or the identity search endpoint requires elevated permissions.
+
+**Solution:** This is a known limitation with PAT-based authentication. The identity search API may require additional PAT scopes or different authentication methods.
+
+## MCP Client Issues
+
+### Server not showing up in Claude Desktop
+
+**Solutions:**
+1. Verify the config JSON is valid (check for trailing commas, etc.).
+2. Ensure the `type` is `"streamableHttp"` (not `"stdio"`).
+3. Restart Claude Desktop completely after editing the config.
+4. Test the server URL directly: `curl https://<FQDN>/healthz`
+
+### Tools not appearing in VS Code Agent Mode
+
+**Solutions:**
+1. Reload the VS Code window: `Ctrl+Shift+P` > `Developer: Reload Window`.
+2. Verify `.vscode/mcp.json` is correctly formatted.
+3. Click "Add Context" in Agent Mode and check that tools are listed.
+4. Check the Output panel for MCP-related errors.
+
+### Too many tools (128 tool limit)
+
+**Symptom:** MCP client warns about exceeding the tool limit.
+
+**Solution:** Use the `domains` field during user registration to limit which tool domains are enabled. For example, register with `"domains": "core,repositories"` to exclude search tools.
+
+## Server Logs
+
+To increase log verbosity, set the `LOG_LEVEL` environment variable on the Container App:
+
+```bash
+az containerapp update --name ado-mcp-server --resource-group rg-ado-mcp \
+  --set-env-vars "LOG_LEVEL=debug"
 ```
-Error occurred: ...
+
+Available log levels: `error`, `warn`, `info`, `debug`.
+
+View logs:
+
+```bash
+az containerapp logs show --name ado-mcp-server --resource-group rg-ado-mcp --type console --follow
 ```
-
-#### Solution
-
-Try using Azure login context instead:
-
-1. Install [Azure CLI](https://learn.microsoft.com/en-us/cli/azure/install-azure-cli?view=azure-cli-latest) and **log in**:
-
-   ```sh
-   az login
-   ```
-
-2. **Configure the MCP server** with the azcli authentication option by updating your `.vscode/mcp.json`.
-
-   ```json
-   {
-     "inputs": [
-       {
-         "id": "ado_org",
-         "type": "promptString",
-         "description": "Azure DevOps organization name (e.g. 'contoso')"
-       }
-     ],
-     "servers": {
-       "ado": {
-         "type": "stdio",
-         "command": "npx",
-         "args": ["-y", "@azure-devops/mcp", "${input:ado_org}", "--authentication", "azcli"]
-       }
-     }
-   }
-   ```
-
-3. **Restart VS Code** completely to ensure the MCP server picks up the new configuration.
-
-### Multi-Tenant Authentication Problems when using azcli
-
-If you encounter authentication errors like `TF400813: The user 'xxx' is not authorized to access this resource`, you may be experiencing multi-tenant authentication issues.
-
-#### Symptoms
-
-- Azure CLI (`az devops project list`) works fine
-- MCP server fails with authorization errors
-- You have access to multiple Azure tenants
-
-#### Root Cause
-
-The MCP server may be authenticating with a different tenant than your Azure DevOps organization, especially when you have access to multiple Azure tenants. The MCP server may also be using the Azure Devops Org tenant when the user belongs to a different tenant and is added as a guest user in the Azure DevOps organization.
-
-#### Solution
-
-1. **Identify the correct tenant ID** for your Azure DevOps organization:
-
-   ```pwsh
-   az account list
-   ```
-
-   Look for the `tenantId` field in the output for the desired tenant (for guest accounts this will be the tenant of your organization and may be different than the Azure Devops Organization tenant).
-
-2. **Configure the MCP server with the tenant ID** by updating your `.vscode/mcp.json`.
-
-   🧨 Installation from Public Feed Configuration:
-
-   ```json
-   {
-     "inputs": [
-       {
-         "id": "ado_org",
-         "type": "promptString",
-         "description": "Azure DevOps organization name (e.g. 'contoso')"
-       },
-       {
-         "id": "ado_tenant",
-         "type": "promptString",
-         "description": "Azure tenant ID (required for multi-tenant scenarios)"
-       }
-     ],
-     "servers": {
-       "ado": {
-         "type": "stdio",
-         "command": "npx",
-         "args": ["-y", "@azure-devops/mcp", "${input:ado_org}", "--authentication", "azcli", "--tenant", "${input:ado_tenant}"]
-       }
-     }
-   }
-   ```
-
-   🛠️ Installation from Source Configuration:
-
-   ```json
-   {
-     "inputs": [
-       {
-         "id": "ado_org",
-         "type": "promptString",
-         "description": "Azure DevOps organization name (e.g. 'contoso')"
-       },
-       {
-         "id": "ado_tenant",
-         "type": "promptString",
-         "description": "Azure tenant ID (required for multi-tenant scenarios)"
-       }
-     ],
-     "servers": {
-       "ado": {
-         "type": "stdio",
-         "command": "mcp-server-azuredevops",
-         "args": ["${input:ado_org}", "--tenant", "${input:ado_tenant}"]
-       }
-     }
-   }
-   ```
-
-3. **Restart VS Code** completely to ensure the MCP server picks up the new configuration.
-
-4. **When prompted**, enter:
-   - Your Azure DevOps organization name
-   - The tenant ID from step 1
-
-## Common Errors
-
-1. **Incorrect Organization Name Error**
-
-   ```
-   Error fetching projects: Failed to find api location for area: Location id: e81700f7-3be2-46de-8624-2eb35882fcaa
-   ```
-
-   **Cause:** This occurs when the Azure DevOps organization name is incorrect or doesn't exist.
-
-   **Solution:** Verify that:
-   - The organization name is spelled correctly (case-sensitive)
-   - The organization exists and you have access to it
-   - You're using just the organization name, not the full URL (e.g., use `contoso` not `https://dev.azure.com/contoso`)

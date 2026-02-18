@@ -7,9 +7,12 @@ import { getBearerHandler, WebApi } from "azure-devops-node-api";
 import express, { Request, Response } from "express";
 import cors from "cors";
 
-import { createAuthenticator } from "./auth.js";
+import { createSessionAuthenticator } from "./auth.js";
+import { mcpAuthMiddleware } from "./auth/middleware.js";
+import { getUserByEmail } from "./auth/keyvault-store.js";
+import type { SessionContext, UserConfig } from "./auth/types.js";
+import { adminRouter } from "./admin/routes.js";
 import { logger } from "./logger.js";
-import { getOrgTenant } from "./org-tenants.js";
 import { configureAllTools } from "./tools.js";
 import { UserAgentComposer } from "./useragent.js";
 import { packageVersion } from "./version.js";
@@ -18,29 +21,20 @@ import { DomainsManager } from "./shared/domains.js";
 // ---------------------------------------------------------------------------
 // Environment configuration
 // ---------------------------------------------------------------------------
-const orgName: string = process.env.ADO_ORG ?? "";
-if (!orgName) {
-  logger.error("Environment variable ADO_ORG is required");
-  process.exit(1);
-}
-
-const orgUrl = `https://dev.azure.com/${orgName}`;
 const port = parseInt(process.env.PORT || "3000", 10);
-const defaultDomains = "core,repositories,search";
-const domainsManager = new DomainsManager(process.env.ADO_DOMAINS?.split(",") ?? defaultDomains.split(","));
-const enabledDomains = domainsManager.getEnabledDomains();
 
 // ---------------------------------------------------------------------------
-// Azure DevOps client factory
+// Azure DevOps client factory (per-session, uses stored URL from Key Vault)
 // ---------------------------------------------------------------------------
-function getAzureDevOpsClient(
-  getToken: () => Promise<string>,
+function createConnectionProvider(
+  userConfig: UserConfig,
   userAgentComposer: UserAgentComposer,
 ): () => Promise<WebApi> {
+  const authenticator = createSessionAuthenticator(userConfig.pat);
   return async () => {
-    const accessToken = await getToken();
+    const accessToken = await authenticator();
     const authHandler = getBearerHandler(accessToken);
-    return new WebApi(orgUrl, authHandler, undefined, {
+    return new WebApi(userConfig.url, authHandler, undefined, {
       productName: "RSM.AzureDevOps.MCP.Readonly",
       productVersion: packageVersion,
       userAgent: userAgentComposer.userAgent,
@@ -49,9 +43,12 @@ function getAzureDevOpsClient(
 }
 
 // ---------------------------------------------------------------------------
-// MCP server factory – one server instance per session
+// MCP server factory – one per session, scoped to user credentials
 // ---------------------------------------------------------------------------
-function createMcpServer(authenticator: () => Promise<string>, userAgentComposer: UserAgentComposer): McpServer {
+function createMcpServer(
+  userConfig: UserConfig,
+  userAgentComposer: UserAgentComposer,
+): McpServer {
   const server = new McpServer({
     name: "RSM Azure DevOps MCP Server (Read-Only)",
     version: packageVersion,
@@ -61,13 +58,18 @@ function createMcpServer(authenticator: () => Promise<string>, userAgentComposer
     userAgentComposer.appendMcpClientInfo(server.server.getClientVersion());
   };
 
+  const authenticator = createSessionAuthenticator(userConfig.pat);
+  const connectionProvider = createConnectionProvider(userConfig, userAgentComposer);
+  const domainsManager = new DomainsManager(userConfig.domains?.split(","));
+  const enabledDomains = domainsManager.getEnabledDomains();
+
   configureAllTools(
     server,
     authenticator,
-    getAzureDevOpsClient(authenticator, userAgentComposer),
+    connectionProvider,
     () => userAgentComposer.userAgent,
     enabledDomains,
-    orgName,
+    userConfig.org,
   );
 
   return server;
@@ -76,22 +78,17 @@ function createMcpServer(authenticator: () => Promise<string>, userAgentComposer
 // ---------------------------------------------------------------------------
 // Session management
 // ---------------------------------------------------------------------------
-const transports = new Map<string, StreamableHTTPServerTransport>();
+const sessions = new Map<string, SessionContext>();
 
 // ---------------------------------------------------------------------------
 // Express application
 // ---------------------------------------------------------------------------
 async function main() {
-  const tenantId = (await getOrgTenant(orgName)) ?? process.env.ADO_TENANT_ID;
-  const authenticator = createAuthenticator();
-
-  const userAgentComposer = new UserAgentComposer(packageVersion);
-
   const app = express();
   app.use(cors());
   app.use(express.json());
 
-  // ── Health probes ────────────────────────────────────────────────────
+  // ── Health probes (unauthenticated) ─────────────────────────────────
   app.get("/healthz", (_req: Request, res: Response) => {
     res.status(200).json({ status: "healthy" });
   });
@@ -100,35 +97,80 @@ async function main() {
     res.status(200).json({ status: "ready" });
   });
 
-  // ── MCP endpoint (POST) – handles JSON-RPC requests ──────────────────
+  // ── Admin routes (/admin/*) — protected by ADMIN_API_KEY ────────────
+  app.use("/admin", adminRouter);
+
+  // ── MCP auth middleware for /mcp routes ──────────────────────────────
+  app.use("/mcp", mcpAuthMiddleware());
+
+  // ── MCP endpoint (POST) – handles JSON-RPC requests ─────────────────
   app.post("/mcp", async (req: Request, res: Response) => {
     try {
       const sessionId = req.headers["mcp-session-id"] as string | undefined;
-      let transport = sessionId ? transports.get(sessionId) : undefined;
+      let session = sessionId ? sessions.get(sessionId) : undefined;
 
-      if (!transport) {
-        // New session – create transport and MCP server
-        transport = new StreamableHTTPServerTransport({
+      // Verify session ownership — prevent cross-user session access
+      if (session && req.authenticatedUser?.email.toLowerCase() !== session.userEmail) {
+        res.status(403).json({ error: "Session belongs to another user." });
+        return;
+      }
+
+      if (!session) {
+        // New session — look up user in Key Vault
+        const user = req.authenticatedUser;
+        if (!user) {
+          res.status(401).json({ error: "Authentication required." });
+          return;
+        }
+
+        const userConfig = await getUserByEmail(user.email);
+        if (!userConfig) {
+          res.status(403).json({
+            error: `User '${user.email}' is not registered. Contact an admin.`,
+          });
+          return;
+        }
+
+        const userAgentComposer = new UserAgentComposer(packageVersion);
+
+        // Declare server first so it's available in the onsessioninitialized callback
+        let server: McpServer;
+
+        const transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => crypto.randomUUID(),
           onsessioninitialized: (newSessionId: string) => {
-            transports.set(newSessionId, transport!);
-            logger.info("MCP session created", { sessionId: newSessionId });
+            sessions.set(newSessionId, {
+              transport,
+              server,
+              userConfig,
+              userEmail: user.email,
+              createdAt: new Date(),
+            });
+            logger.info("MCP session created", {
+              sessionId: newSessionId,
+              email: user.email,
+              org: userConfig.org,
+              authMethod: user.authMethod,
+            });
           },
         });
 
         transport.onclose = () => {
-          const sid = [...transports.entries()].find(([, t]) => t === transport)?.[0];
+          const sid = [...sessions.entries()].find(([, s]) => s.transport === transport)?.[0];
           if (sid) {
-            transports.delete(sid);
-            logger.info("MCP session closed", { sessionId: sid });
+            sessions.delete(sid);
+            logger.info("MCP session closed", { sessionId: sid, email: user.email });
           }
         };
 
-        const server = createMcpServer(authenticator, userAgentComposer);
+        server = createMcpServer(userConfig, userAgentComposer);
         await server.connect(transport);
+
+        // Temporary session reference for this initial request (before session ID is assigned)
+        session = { transport, server, userConfig, userEmail: user.email, createdAt: new Date() };
       }
 
-      await transport.handleRequest(req, res, req.body);
+      await session.transport.handleRequest(req, res, req.body);
     } catch (err) {
       logger.error("Error handling MCP POST request", { error: err });
       if (!res.headersSent) {
@@ -140,62 +182,68 @@ async function main() {
   // ── MCP endpoint (GET) – SSE stream for server-to-client notifications
   app.get("/mcp", async (req: Request, res: Response) => {
     const sessionId = req.headers["mcp-session-id"] as string | undefined;
-    const transport = sessionId ? transports.get(sessionId) : undefined;
+    const session = sessionId ? sessions.get(sessionId) : undefined;
 
-    if (!transport) {
+    if (!session) {
       res.status(400).json({ error: "No active session. Send an initialize request first." });
       return;
     }
 
-    await transport.handleRequest(req, res);
+    if (req.authenticatedUser?.email.toLowerCase() !== session.userEmail) {
+      res.status(403).json({ error: "Session belongs to another user." });
+      return;
+    }
+
+    await session.transport.handleRequest(req, res);
   });
 
-  // ── MCP endpoint (DELETE) – session teardown ─────────────────────────
+  // ── MCP endpoint (DELETE) – session teardown ────────────────────────
   app.delete("/mcp", async (req: Request, res: Response) => {
     const sessionId = req.headers["mcp-session-id"] as string | undefined;
-    const transport = sessionId ? transports.get(sessionId) : undefined;
+    const session = sessionId ? sessions.get(sessionId) : undefined;
 
-    if (!transport) {
+    if (!session) {
       res.status(400).json({ error: "No active session." });
       return;
     }
 
-    await transport.handleRequest(req, res);
+    if (req.authenticatedUser?.email.toLowerCase() !== session.userEmail) {
+      res.status(403).json({ error: "Session belongs to another user." });
+      return;
+    }
+
+    await session.transport.handleRequest(req, res);
   });
 
-  // ── Start listening ──────────────────────────────────────────────────
+  // ── Start listening ─────────────────────────────────────────────────
   const httpServer = app.listen(port, () => {
-    logger.info("RSM Azure DevOps MCP Server started", {
-      organization: orgName,
-      organizationUrl: orgUrl,
+    logger.info("RSM Azure DevOps MCP Server started (multi-tenant)", {
       port,
-      enabledDomains: Array.from(enabledDomains),
       version: packageVersion,
-      tenantId: tenantId ?? "auto-detected or not set",
+      keyVault: process.env["AZURE_KEYVAULT_URL"] ?? "not set",
+      aadConfigured: !!(process.env["AAD_TENANT_ID"] && process.env["AAD_CLIENT_ID"]),
     });
   });
 
-  // ── Graceful shutdown ────────────────────────────────────────────────
+  // ── Graceful shutdown ───────────────────────────────────────────────
   const shutdown = async (signal: string) => {
     logger.info(`Received ${signal}, shutting down gracefully...`);
 
-    // Close all active transports
-    for (const [sid, transport] of transports) {
+    for (const [sid, session] of sessions) {
       try {
-        await transport.close();
+        await session.transport.close();
         logger.info("Closed MCP session", { sessionId: sid });
       } catch (err) {
         logger.error("Error closing MCP session", { sessionId: sid, error: err });
       }
     }
-    transports.clear();
+    sessions.clear();
 
     httpServer.close(() => {
       logger.info("HTTP server closed");
       process.exit(0);
     });
 
-    // Force exit after 10 seconds
     setTimeout(() => {
       logger.warn("Forced shutdown after timeout");
       process.exit(1);

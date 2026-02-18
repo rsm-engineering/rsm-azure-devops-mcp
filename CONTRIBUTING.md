@@ -1,104 +1,167 @@
-# Contributing to Azure DevOps MCP Server
+# Contributing
 
-[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/microsoft/azure-devops-mcp)
+## Development Setup
 
-Thank you for your interest in contributing to the Azure DevOps MCP Server! Your participation—whether through discussions, reporting issues, or suggesting improvements—helps us make the project better for everyone.
+### Prerequisites
 
-> 🚨 If you would like to contribute, please carefully follow the guidelines below. Pull requests that do not adhere to this process will be closed without review.
+- [Node.js](https://nodejs.org/) 20+
+- [Azure CLI](https://learn.microsoft.com/en-us/cli/azure/install-azure-cli)
+- [Docker](https://docs.docker.com/get-docker/) (optional, for local container testing)
+- An Azure subscription (for Key Vault access during development)
 
-## 🏆 Expectations
+### Install dependencies
 
-As noted in the `README.md`, we aim to keep the tools in this MCP Server simple and focused on specific scenarios. If you wish to contribute or suggest new tools, please keep this in mind. We do not plan to introduce complex tools that require extensive logic. Our goal is to provide a straightforward abstraction layer over the REST API to accomplish targeted tasks.
+```bash
+npm install
+```
 
-## 🪲 Bugs and feature requests
+### Build
 
-Before submitting a new issue or suggestion, please search the existing issues to check if it has already been reported. If you find a matching issue, upvote (👍) it and consider adding a comment describing your specific scenario or requirements. This helps us prioritize based on community impact.
+```bash
+npm run build
+```
 
-If your concern is not already tracked, feel free to [log a new issue](https://github.com/microsoft/azure-devops-mcp/issues). The code owners team will review your submission and may approve, request clarification, or reject it. Once approved, you can proceed with your contribution.
+The project compiles TypeScript from `src/` to `dist/`.
 
-## 📝 Creating issues
+### Run locally
 
-When creating an issue:
+The server requires `AZURE_KEYVAULT_URL` to be set. For local development, authenticate to Key Vault via Azure CLI:
 
-- **DO** use a clear, descriptive title that identifies the problem or requested feature.
-- **DO** provide a detailed description of the issue or feature request.
-- **DO** include any relevant REST endpoints you wish to integrate with. Refer to the [public REST API documentation](https://learn.microsoft.com/en-us/rest/api/azure/devops).
+```bash
+az login
 
-For reference, see [this example of a well-formed issue](https://github.com/microsoft/azure-devops-mcp/issues/70).
+export AZURE_KEYVAULT_URL="https://kv-rsm-ado-mcp.vault.azure.net/"
+export ADMIN_API_KEY="local-dev-key"
+export PORT=3000
 
-## 👩‍💻 Writing code
+npm start
+```
 
-We’re currently accepting a limited number of pull requests, provided they follow the established process and remain simple in scope. If you notice something that should be changed or added, please **create an issue first** and provide details. Once reviewed, and if it makes sense to proceed, we will respond with a 👍.
+The server starts on `http://localhost:3000`. Test with:
 
-Please include tests with your pull request. Pull requests will not be accepted until all relevant tests are updated and passing.
+```bash
+curl http://localhost:3000/healthz
+```
 
-Code formatting is enforced by CI checks. Run `npm run format` to ensure your changes comply with the rules.
+### Run with Docker locally
+
+```bash
+docker build -t ado-mcp-readonly .
+
+docker run -p 3000:3000 \
+  -e AZURE_KEYVAULT_URL="https://kv-rsm-ado-mcp.vault.azure.net/" \
+  -e ADMIN_API_KEY="local-dev-key" \
+  ado-mcp-readonly
+```
+
+Note: For Key Vault access from a local Docker container, you'll need to configure Azure credentials inside the container or use a local secrets store for development.
+
+## Project Structure
+
+```
+src/
+  index.ts              # Express app, MCP session management, HTTP endpoints
+  tools.ts              # Tool domain router (core, repositories, search)
+  auth.ts               # Session authenticator factory
+  logger.ts             # Winston logger (JSON format)
+  version.ts            # Package version reader
+  useragent.ts          # User-Agent header composer
+  auth/
+    types.ts            # Shared types (UserConfig, AuthenticatedUser, SessionContext)
+    keyvault-store.ts   # Key Vault CRUD with 5-min cache
+    aad-validator.ts    # AAD/Entra ID JWT validation (jose)
+    middleware.ts       # Express auth middleware for /mcp routes
+  admin/
+    routes.ts           # Admin API routes (user CRUD)
+  tools/
+    core.ts             # Core domain tools (projects, teams, identities)
+    repositories.ts     # Repository domain tools (repos, branches, PRs, commits)
+    search.ts           # Search domain tools (code, wiki, work items)
+  shared/
+    domains.ts          # Domain enum and manager
+deploy/
+  deploy.sh             # Full Azure deployment script
+  rebuild.sh            # Rebuild Docker image and restart Container App
+  config.sh             # Shared configuration (resource names, sizing)
+docs/
+  GETTINGSTARTED.md     # Deployment and client setup guide
+  TOOLSET.md            # Detailed tool parameter documentation
+  TROUBLESHOOTING.md    # Common issues and solutions
+  FAQ.md                # Frequently asked questions
+  HOWTO.md              # Tips for better MCP experience
+  EXAMPLES.md           # Example prompts and usage
+```
+
+## Coding Guidelines
+
+### Read-only principle
+
+This server is intentionally read-only. Do not add tools that create, update, or delete Azure DevOps resources. All tools should only retrieve data.
+
+### Tool naming
+
+Tools are named with a domain prefix:
+- `core_` for core/project tools
+- `repo_` for repository tools
+- `search_` for search tools
+
+### Per-session scoping
+
+All tools receive credentials through closures (`tokenProvider`, `connectionProvider`). Never access global state for user credentials. Each MCP server instance is scoped to a single user's session.
+
+### Code style
+
+- TypeScript strict mode
+- Format with: `npm run format`
+- Lint before committing
 
 ### Testing
-
-This project uses Jest with `ts-jest` for testing TypeScript code. Tests are located in the `test/` directory and mirror the structure of the `src/` directory.
-
-#### Running Tests
 
 ```bash
 # Run all tests
 npm test
 
-# Run specific test file
+# Run a specific test file
 npm test test/src/utils.test.ts
 
-# Run tests with coverage report
+# Run with coverage
 npm test -- --coverage
 ```
 
-#### Jest Configuration
+Tests use Jest with `ts-jest`. Test files are in the `test/` directory mirroring the `src/` structure.
 
-The project uses a modern Jest + ts-jest configuration:
+## Deployment
 
-- **jest.config.cjs**: Main Jest configuration using the modern transform array syntax
-- **tsconfig.jest.json**: Test-specific TypeScript configuration that extends the base `tsconfig.json`
+### Full deployment
 
-Key features of our test configuration:
+```bash
+export ADMIN_API_KEY="your-admin-key"
+export AAD_TENANT_ID="your-tenant-id"    # or "placeholder"
+export AAD_CLIENT_ID="your-client-id"    # or "placeholder"
+export AZURE_SUBSCRIPTION_ID="your-subscription-id"
 
-- **isolatedModules: true** - Enabled in `tsconfig.jest.json` to eliminate ts-jest "hybrid module kind" warnings. This ensures each file is transpiled independently, which is more performant and aligns with how `ts-jest` processes files.
-- **CommonJS modules** - Tests use CommonJS (`module: "CommonJS"`) to ensure compatibility with Jest's test environment.
-
-## 🖊️ Coding style
-
-Follow the established patterns and styles in the repository. If you have suggestions for improvements, please open a new issue for discussion.
-
-## 📑 Documentation
-
-Update relevant documentation (e.g., README, existing code comments) to reflect new or altered functionality. Well-documented changes enable reviewers and future contributors to quickly understand the rationale and intended use of your code.
-
-## 🐛 Debugging
-
-MCP servers use `stdio` to communicate with the client. Logs must never appear in `stdout` (which would break the protocol contract) and should be directed to `stderr` instead.
-
-All `winston` logs in this project are automatically redirected to `stderr`. To view debug logs:
-
-1. Set the `LOG_LEVEL` environment variable in your MCP client configuration (e.g., in your `mcp.json` file):
-
-```json
-{
-  "mcpServers": {
-    "azure-devops": {
-      "command": "node",
-      "args": ["path/to/dist/index.js"],
-      "env": {
-        "LOG_LEVEL": "debug"
-      }
-    }
-  }
-}
+bash deploy/deploy.sh
 ```
 
-2. Alternatively, set `LOG_LEVEL` as an environment variable in your shell before starting the MCP client.
+### Rebuild after code changes
 
-Available log levels: `error`, `warn`, `info`, `debug`.
+```bash
+bash deploy/rebuild.sh
+```
 
-You can examine these logs at the `output` panel under `MCP:ado` (or whatever name you used in `mcp.json` file).
+### Configuration
 
-## 🤝 Code of conduct
+Edit `deploy/config.sh` to customize resource names, region, and container sizing before deploying.
 
-You can find our code of conduct at the [Code of Conduct](./CODE_OF_CONDUCT.md) as a guideline for expected behavior in also at the contributions here. Please take a moment to review it before contributing.
+## Architecture Notes
+
+- **Transport**: Streamable HTTP (not stdio). The server is a standard Express HTTP app.
+- **Sessions**: Per-user MCP server instances. Each session has its own `McpServer`, `StreamableHTTPServerTransport`, and credential closures.
+- **Auth flow**: Request → middleware (API key or AAD JWT) → Key Vault lookup → session creation/reuse → tool execution with user's PAT.
+- **Caching**: User configs are cached in-memory for 5 minutes to reduce Key Vault calls.
+
+## License
+
+Licensed under the [MIT License](./LICENSE.md).
+
+Based on [Microsoft's azure-devops-mcp](https://github.com/microsoft/azure-devops-mcp), licensed under MIT.

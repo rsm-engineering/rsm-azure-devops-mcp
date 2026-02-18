@@ -1,216 +1,299 @@
-# ⭐ Azure DevOps MCP Server
+# RSM Azure DevOps MCP Server (Read-Only, Multi-Tenant)
 
-Easily install the Azure DevOps MCP Server for VS Code or VS Code Insiders:
+A containerized, read-only [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) server for Azure DevOps, designed for multi-tenant deployment on Azure Container Apps. Based on [Microsoft's azure-devops-mcp](https://github.com/microsoft/azure-devops-mcp), stripped down to read-only operations and re-architected for shared container deployment.
 
-[![Install with NPX in VS Code](https://img.shields.io/badge/VS_Code-Install_AzureDevops_MCP_Server-0098FF?style=flat-square&logo=visualstudiocode&logoColor=white)](https://insiders.vscode.dev/redirect/mcp/install?name=ado&config=%7B%20%22type%22%3A%20%22stdio%22%2C%20%22command%22%3A%20%22npx%22%2C%20%22args%22%3A%20%5B%22-y%22%2C%20%22%40azure-devops%2Fmcp%22%2C%20%22%24%7Binput%3Aado_org%7D%22%5D%7D&inputs=%5B%7B%22id%22%3A%20%22ado_org%22%2C%20%22type%22%3A%20%22promptString%22%2C%20%22description%22%3A%20%22Azure%20DevOps%20organization%20name%20%20%28e.g.%20%27contoso%27%29%22%7D%5D)
-[![Install with NPX in VS Code Insiders](https://img.shields.io/badge/VS_Code_Insiders-Install_AzureDevops_MCP_Server-24bfa5?style=flat-square&logo=visualstudiocode&logoColor=white)](https://insiders.vscode.dev/redirect/mcp/install?name=ado&quality=insiders&config=%7B%20%22type%22%3A%20%22stdio%22%2C%20%22command%22%3A%20%22npx%22%2C%20%22args%22%3A%20%5B%22-y%22%2C%20%22%40azure-devops%2Fmcp%22%2C%20%22%24%7Binput%3Aado_org%7D%22%5D%7D&inputs=%5B%7B%22id%22%3A%20%22ado_org%22%2C%20%22type%22%3A%20%22promptString%22%2C%20%22description%22%3A%20%22Azure%20DevOps%20organization%20name%20%20%28e.g.%20%27contoso%27%29%22%7D%5D)
+## Table of Contents
 
-This TypeScript project provides a **local** MCP server for Azure DevOps, enabling you to perform a wide range of Azure DevOps tasks directly from your code editor.
+1. [Overview](#overview)
+2. [Architecture](#architecture)
+3. [Supported Tools](#supported-tools)
+4. [Quick Start](#quick-start)
+5. [Deployment](#deployment)
+6. [User Management](#user-management)
+7. [Client Configuration](#client-configuration)
+8. [Using Domains](#using-domains)
+9. [Security](#security)
+10. [Troubleshooting](#troubleshooting)
+11. [Contributing](#contributing)
 
-## 📄 Table of Contents
+## Overview
 
-1. [📺 Overview](#-overview)
-2. [🏆 Expectations](#-expectations)
-3. [⚙️ Supported Tools](#️-supported-tools)
-4. [🔌 Installation & Getting Started](#-installation--getting-started)
-5. [🌏 Using Domains](#-using-domains)
-6. [📝 Troubleshooting](#-troubleshooting)
-7. [🎩 Examples & Best Practices](#-examples--best-practices)
-8. [🙋‍♀️ Frequently Asked Questions](#️-frequently-asked-questions)
-9. [📌 Contributing](#-contributing)
+This server exposes Azure DevOps read-only operations (projects, repos, branches, pull requests, commits, search, work item search) as MCP tools over Streamable HTTP transport. A single container serves multiple users, each authenticated with their own credentials stored in Azure Key Vault.
 
-## 📺 Overview
+Key design principles:
 
-The Azure DevOps MCP Server brings Azure DevOps context to your agents. Try prompts like:
+- **Read-only**: No write operations. Safe for broad access.
+- **Multi-tenant**: One container, many users. Each session is scoped to a user's own Azure DevOps org, URL, and PAT.
+- **Zero per-user infrastructure**: No need to spin up/down containers per user or org. User credentials are managed via an admin API.
+- **Secure**: AAD/Entra ID JWT validation or per-user API keys. Session ownership enforced on every request.
 
-- "List my ADO projects"
-- "List ADO Builds for 'Contoso'"
-- "List ADO Repos for 'Contoso'"
-- "List test plans for 'Contoso'"
-- "List teams for project 'Contoso'"
-- "List iterations for project 'Contoso'"
-- "List my work items for project 'Contoso'"
-- "List work items in current iteration for 'Contoso' project and 'Contoso Team'"
-- "List all wikis in the 'Contoso' project"
-- "Create a wiki page '/Architecture/Overview' with content about system design"
-- "Update the wiki page '/Getting Started' with new onboarding instructions"
-- "Get the content of the wiki page '/API/Authentication' from the Documentation wiki"
+## Architecture
 
-## 🏆 Expectations
+```
+Claude Desktop / MCP Clients
+  |  (x-api-key or Bearer AAD token)
+  v
++----------------------------------+
+|  Single Azure Container App      |
+|  +----------------------------+  |
+|  | Auth Middleware             |  |  Validates AAD JWT or API key
+|  |   |                        |  |
+|  | Key Vault Lookup (cached)  |  |  Gets user's org + URL + PAT
+|  |   |                        |  |
+|  | Per-Session MCP Server     |  |  Closures scoped to user creds
+|  +----------------------------+  |
+|                                  |
+|  /admin/users  (CRUD)            |  Admin registers users -> Key Vault
+|  /healthz, /readyz               |  Health probes
++----------------+-----------------+
+                 |
+                 v
+         Azure Key Vault
+         (user configs as JSON secrets)
+```
 
-The Azure DevOps MCP Server is built from tools that are concise, simple, focused, and easy to use—each designed for a specific scenario. We intentionally avoid complex tools that try to do too much. The goal is to provide a thin abstraction layer over the REST APIs, making data access straightforward and letting the language model handle complex reasoning.
+### How sessions work
 
-## ⚙️ Supported Tools
+1. Client sends `POST /mcp` with `x-api-key` (or `Authorization: Bearer <AAD-token>`)
+2. Auth middleware resolves user identity
+3. Key Vault lookup returns `UserConfig` (org, URL, PAT, domains)
+4. A per-session MCP server is created with closures scoped to that user's credentials
+5. Subsequent requests include `mcp-session-id` header to reuse the session
+6. Session ownership is verified on every request (POST, GET, DELETE)
 
-See [TOOLSET.md](./docs/TOOLSET.md) for a comprehensive list.
+## Supported Tools
 
-## 🔌 Installation & Getting Started
+This server exposes **read-only** tools from three domains:
 
-For the best experience, use Visual Studio Code and GitHub Copilot. See the [getting started documentation](./docs/GETTINGSTARTED.md) to use our MCP Server with other tools such as Visual Studio 2022, Claude Code, and Cursor.
+| Domain | Tools | Description |
+|--------|-------|-------------|
+| **Core** | `core_list_projects`, `core_list_project_teams`, `core_get_identity_ids` | List projects, teams, and identities |
+| **Repositories** | `repo_list_repos_by_project`, `repo_get_repo_by_name_or_id`, `repo_list_branches_by_repo`, `repo_get_branch_by_name`, `repo_search_commits`, `repo_list_pull_requests_by_repo_or_project`, `repo_list_pull_requests_by_assigned_to`, `repo_get_pull_request_by_id`, `repo_list_pull_request_threads`, `repo_list_pull_request_thread_comments`, `repo_list_pull_requests_by_commits`, `repo_list_my_branches_by_repo` | Browse repos, branches, PRs, commits |
+| **Search** | `search_code`, `search_wiki`, `search_workitem` | Search code, wiki, and work items |
+
+See [docs/TOOLSET.md](./docs/TOOLSET.md) for detailed parameter documentation per tool.
+
+## Quick Start
 
 ### Prerequisites
 
-1. Install [VS Code](https://code.visualstudio.com/download) or [VS Code Insiders](https://code.visualstudio.com/insiders)
-2. Install [Node.js](https://nodejs.org/en/download) 20+
-3. Open VS Code in an empty folder
+- [Azure CLI](https://learn.microsoft.com/en-us/cli/azure/install-azure-cli) (`az`)
+- An Azure subscription with permissions to create: Resource Group, ACR, Key Vault, Container Apps
+- An Azure DevOps PAT with read access for each user
 
-### Installation
+### Deploy
 
-#### ✨ One-Click Install
+```bash
+# Set required env vars
+export ADMIN_API_KEY="your-admin-secret-key"
+export AAD_TENANT_ID="your-aad-tenant-id"        # or "placeholder" if not using AAD
+export AAD_CLIENT_ID="your-aad-app-client-id"     # or "placeholder" if not using AAD
+export AZURE_SUBSCRIPTION_ID="your-subscription-id"
 
-[![Install with NPX in VS Code](https://img.shields.io/badge/VS_Code-Install_AzureDevops_MCP_Server-0098FF?style=flat-square&logo=visualstudiocode&logoColor=white)](https://insiders.vscode.dev/redirect/mcp/install?name=ado&config=%7B%20%22type%22%3A%20%22stdio%22%2C%20%22command%22%3A%20%22npx%22%2C%20%22args%22%3A%20%5B%22-y%22%2C%20%22%40azure-devops%2Fmcp%22%2C%20%22%24%7Binput%3Aado_org%7D%22%5D%7D&inputs=%5B%7B%22id%22%3A%20%22ado_org%22%2C%20%22type%22%3A%20%22promptString%22%2C%20%22description%22%3A%20%22Azure%20DevOps%20organization%20name%20%20%28e.g.%20%27contoso%27%29%22%7D%5D)
-[![Install with NPX in VS Code Insiders](https://img.shields.io/badge/VS_Code_Insiders-Install_AzureDevops_MCP_Server-24bfa5?style=flat-square&logo=visualstudiocode&logoColor=white)](https://insiders.vscode.dev/redirect/mcp/install?name=ado&quality=insiders&config=%7B%20%22type%22%3A%20%22stdio%22%2C%20%22command%22%3A%20%22npx%22%2C%20%22args%22%3A%20%5B%22-y%22%2C%20%22%40azure-devops%2Fmcp%22%2C%20%22%24%7Binput%3Aado_org%7D%22%5D%7D&inputs=%5B%7B%22id%22%3A%20%22ado_org%22%2C%20%22type%22%3A%20%22promptString%22%2C%20%22description%22%3A%20%22Azure%20DevOps%20organization%20name%20%20%28e.g.%20%27contoso%27%29%22%7D%5D)
+# Run the deployment
+bash deploy/deploy.sh
+```
 
-After installation, select GitHub Copilot Agent Mode and refresh the tools list. Learn more about Agent Mode in the [VS Code Documentation](https://code.visualstudio.com/docs/copilot/chat/chat-agent-mode).
+This creates: Resource Group, ACR, Key Vault, Container App Environment, Container App with Managed Identity, and RBAC for Key Vault access.
 
-#### 🧨 Install from Public Feed (Recommended)
+### Register a user
 
-This installation method is the easiest for all users of Visual Studio Code.
+```bash
+curl -X POST https://<FQDN>/admin/users \
+  -H "x-api-key: $ADMIN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "email": "user@example.com",
+    "org": "MyOrg",
+    "url": "https://dev.azure.com/MyOrg",
+    "pat": "<ADO_PAT>"
+  }'
+# Returns: { "apiKey": "rsmk_..." }
+```
 
-🎥 [Watch this quick start video to get up and running in under two minutes!](https://youtu.be/EUmFM6qXoYk)
-
-##### Steps
-
-In your project, add a `.vscode\mcp.json` file with the following content:
+### Connect from Claude Desktop
 
 ```json
 {
-  "inputs": [
-    {
-      "id": "ado_org",
-      "type": "promptString",
-      "description": "Azure DevOps organization name  (e.g. 'contoso')"
-    }
-  ],
-  "servers": {
-    "ado": {
-      "type": "stdio",
-      "command": "npx",
-      "args": ["-y", "@azure-devops/mcp", "${input:ado_org}"]
+  "mcpServers": {
+    "azure-devops": {
+      "type": "streamableHttp",
+      "url": "https://<FQDN>/mcp",
+      "headers": {
+        "x-api-key": "rsmk_..."
+      }
     }
   }
 }
 ```
 
-🔥 To stay up to date with the latest features, you can use our nightly builds. Simply update your `mcp.json` configuration to use `@azure-devops/mcp@next`. Here is an updated example:
+See the [Getting Started guide](./docs/GETTINGSTARTED.md) for full deployment details and more client configurations.
+
+## Deployment
+
+See [deploy/](./deploy/) for scripts:
+
+| Script | Purpose |
+|--------|---------|
+| `deploy/deploy.sh` | Full deployment (RG, ACR, Key Vault, Container App, RBAC) |
+| `deploy/rebuild.sh` | Rebuild Docker image and restart Container App |
+| `deploy/config.sh` | Shared configuration (resource names, sizing) |
+
+### Environment Variables
+
+The Container App uses these environment variables:
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `AZURE_KEYVAULT_URL` | Yes | Key Vault URL (e.g., `https://kv-rsm-ado-mcp.vault.azure.net/`) |
+| `ADMIN_API_KEY` | Yes | API key for admin endpoints (stored as a Container App secret) |
+| `AAD_TENANT_ID` | No | Azure AD tenant ID (required for AAD token auth) |
+| `AAD_CLIENT_ID` | No | Azure AD app registration client ID (required for AAD token auth) |
+| `PORT` | No | Server port (default: `3000`) |
+| `LOG_LEVEL` | No | Logging level: `error`, `warn`, `info`, `debug` (default: `info`) |
+
+## User Management
+
+The admin API is protected by `ADMIN_API_KEY` (via `x-api-key` header).
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/admin/users` | Register a user (returns generated API key) |
+| `GET` | `/admin/users` | List all users (no PATs/keys exposed) |
+| `DELETE` | `/admin/users/:email` | Remove a user |
+| `POST` | `/admin/users/:email/rotate-key` | Rotate a user's API key |
+
+### Registration payload
 
 ```json
 {
-  "inputs": [
-    {
-      "id": "ado_org",
-      "type": "promptString",
-      "description": "Azure DevOps organization name  (e.g. 'contoso')"
-    }
-  ],
-  "servers": {
-    "ado": {
-      "type": "stdio",
-      "command": "npx",
-      "args": ["-y", "@azure-devops/mcp@next", "${input:ado_org}"]
+  "email": "user@example.com",
+  "org": "MyOrg",
+  "url": "https://dev.azure.com/MyOrg",
+  "pat": "<PERSONAL_ACCESS_TOKEN>",
+  "domains": "core,repositories,search"
+}
+```
+
+The `domains` field is optional and defaults to `core,repositories,search`.
+
+## Client Configuration
+
+### Claude Desktop
+
+```json
+{
+  "mcpServers": {
+    "azure-devops": {
+      "type": "streamableHttp",
+      "url": "https://<FQDN>/mcp",
+      "headers": {
+        "x-api-key": "rsmk_..."
+      }
     }
   }
 }
 ```
 
-Save the file, then click 'Start'.
+### VS Code (MCP extension)
 
-![start mcp server](./docs/media/start-mcp-server.gif)
-
-In chat, switch to [Agent Mode](https://code.visualstudio.com/blogs/2025/02/24/introducing-copilot-agent-mode).
-
-Click "Select Tools" and choose the available tools.
-
-![configure mcp server tools](./docs/media/configure-mcp-server-tools.gif)
-
-Open GitHub Copilot Chat and try a prompt like `List ADO projects`. The first time an ADO tool is executed browser will open prompting to login with your Microsoft account. Please ensure you are using credentials matching selected Azure DevOps organization.
-
-> 💥 We strongly recommend creating a `.github\copilot-instructions.md` in your project. This will enhance your experience using the Azure DevOps MCP Server with GitHub Copilot Chat.
-> To start, just include "`This project uses Azure DevOps. Always check to see if the Azure DevOps MCP server has a tool relevant to the user's request`" in your copilot instructions file.
-
-See the [getting started documentation](./docs/GETTINGSTARTED.md) to use our MCP Server with other tools such as Visual Studio 2022, Claude Code, and Cursor.
-
-## 🌏 Using Domains
-
-Azure DevOps exposes a large surface area. As a result, our Azure DevOps MCP Server includes many tools. To keep the toolset manageable, avoid confusing the model, and respect client limits on loaded tools, use Domains to load only the areas you need. Domains are named groups of related tools (for example: core, work, work-items, repositories, wiki). Add the `-d` argument and the domain names to the server args in your `mcp.json` to list the domains to enable.
-
-For example, use `"-d", "core", "work", "work-items"` to load only Work Item related tools (see the example below).
+In `.vscode/mcp.json`:
 
 ```json
 {
-  "inputs": [
-    {
-      "id": "ado_org",
-      "type": "promptString",
-      "description": "Azure DevOps organization name  (e.g. 'contoso')"
-    }
-  ],
   "servers": {
-    "ado_with_filtered_domains": {
-      "type": "stdio",
-      "command": "npx",
-      "args": ["-y", "@azure-devops/mcp", "${input:ado_org}", "-d", "core", "work", "work-items"]
+    "azure-devops": {
+      "type": "streamableHttp",
+      "url": "https://<FQDN>/mcp",
+      "headers": {
+        "x-api-key": "rsmk_..."
+      }
     }
   }
 }
 ```
 
-Domains that are available are: `core`, `work`, `work-items`, `search`, `test-plans`, `repositories`, `wiki`, `pipelines`, `advanced-security`
+### Claude Code CLI
 
-We recommend that you always enable `core` tools so that you can fetch project level information.
+```bash
+claude mcp add azure-devops \
+  --transport streamable-http \
+  "https://<FQDN>/mcp" \
+  --header "x-api-key: rsmk_..."
+```
 
-> By default all domains are loaded
+### Cursor
 
-## 📝 Troubleshooting
+In `.cursor/mcp.json`:
 
-See the [Troubleshooting guide](./docs/TROUBLESHOOTING.md) for help with common issues and logging.
+```json
+{
+  "mcpServers": {
+    "azure-devops": {
+      "type": "streamableHttp",
+      "url": "https://<FQDN>/mcp",
+      "headers": {
+        "x-api-key": "rsmk_..."
+      }
+    }
+  }
+}
+```
 
-## 🎩 Examples & Best Practices
+## Using Domains
 
-Explore example prompts in our [Examples documentation](./docs/EXAMPLES.md).
+Each user can be registered with specific domains to limit which tools are available in their sessions. Domains are set during user registration via the `domains` field (comma-separated).
 
-For best practices and tips to enhance your experience with the MCP Server, refer to the [How-To guide](./docs/HOWTO.md).
+Available domains: `core`, `repositories`, `search`
 
-## 🙋‍♀️ Frequently Asked Questions
+By default, all three domains are enabled.
 
-For answers to common questions about the Azure DevOps MCP Server, see the [Frequently Asked Questions](./docs/FAQ.md).
+## Security
 
-## 📌 Contributing
+### Authentication methods
 
-We welcome contributions! During preview, please file issues for bugs, enhancements, or documentation improvements.
+| Method | Header | Use Case |
+|--------|--------|----------|
+| **API Key** | `x-api-key: rsmk_...` | Claude Desktop and other MCP clients that don't support OAuth |
+| **AAD/Entra ID** | `Authorization: Bearer <token>` | Enterprise SSO (requires `AAD_TENANT_ID` and `AAD_CLIENT_ID` configured) |
 
-See our [Contributions Guide](./CONTRIBUTING.md) for:
+If a `Bearer` token is present but invalid, the server returns 401 immediately (does not fall back to API key).
 
-- 🛠️ Development setup
-- ✨ Adding new tools
-- 📝 Code style & testing
-- 🔄 Pull request process
+### Session isolation
 
-> ⚠️ Please read the [Contributions Guide](./CONTRIBUTING.md) before creating a pull request.
+- Each session is scoped to the authenticated user's credentials
+- Session ownership is verified on every request (POST, GET, DELETE)
+- One user cannot access another user's session, even with the session ID
+- User configs are cached in-memory for 5 minutes, then refreshed from Key Vault
 
-## 🤝 Code of Conduct
+### Key Vault security
 
-This project follows the [Microsoft Open Source Code of Conduct](https://opensource.microsoft.com/codeofconduct/).
-For questions, see the [FAQ](https://opensource.microsoft.com/codeofconduct/faq/) or contact [open@microsoft.com](mailto:open@microsoft.com).
+- Container App uses system-assigned Managed Identity
+- Managed Identity has "Key Vault Secrets Officer" role
+- User configs stored as JSON secrets named `user-{sanitized-email}`
+- PATs and API keys are never exposed via the admin list endpoint
 
-## 📈 Project Stats
+### PAT scope recommendations
 
-[![Star History Chart](https://api.star-history.com/svg?repos=microsoft/azure-devops-mcp&type=Date)](https://star-history.com/#microsoft/azure-devops-mcp)
+For read-only operations, the Azure DevOps PAT needs these scopes:
 
-## 🏆 Hall of Fame
+| Scope | Required For |
+|-------|-------------|
+| **Project and Team (Read)** | `core_list_projects`, `core_list_project_teams` |
+| **Code (Read)** | All `repo_*` tools |
+| **Work Items (Read)** | `search_workitem` |
+| **Wiki (Read)** | `search_wiki` |
 
-Thanks to all contributors who make this project awesome! ❤️
+## Troubleshooting
 
-[![Contributors](https://contrib.rocks/image?repo=microsoft/azure-devops-mcp)](https://github.com/microsoft/azure-devops-mcp/graphs/contributors)
+See the [Troubleshooting guide](./docs/TROUBLESHOOTING.md) for common issues with deployment, authentication, and Key Vault.
 
-> Generated with [contrib.rocks](https://contrib.rocks)
+## Contributing
+
+See the [Contributing guide](./CONTRIBUTING.md) for development setup and guidelines.
 
 ## License
 
 Licensed under the [MIT License](./LICENSE.md).
 
----
-
-_Trademarks: This project may include trademarks or logos for Microsoft or third parties. Use of Microsoft trademarks or logos must follow [Microsoft’s Trademark & Brand Guidelines](https://www.microsoft.com/en-us/legal/intellectualproperty/trademarks/usage/general). Third-party trademarks are subject to their respective policies._
-
-<!-- version: 2023-04-07 [Do not delete this line, it is used for analytics that drive template improvements] -->
+Based on [Microsoft's azure-devops-mcp](https://github.com/microsoft/azure-devops-mcp), licensed under MIT.
