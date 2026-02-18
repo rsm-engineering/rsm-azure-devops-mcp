@@ -8,6 +8,7 @@ import { z } from "zod";
 import { apiVersion } from "../utils.js";
 import { VersionControlRecursionType } from "azure-devops-node-api/interfaces/GitInterfaces.js";
 import { GitItem } from "azure-devops-node-api/interfaces/GitInterfaces.js";
+import { WorkItem, WorkItemExpand } from "azure-devops-node-api/interfaces/WorkItemTrackingInterfaces.js";
 
 const SEARCH_TOOLS = {
   search_code: "search_code",
@@ -178,9 +179,51 @@ function configureSearchTools(server: McpServer, tokenProvider: () => Promise<st
         throw new Error(`Azure DevOps Work Item Search API error: ${response.status} ${response.statusText}`);
       }
 
-      const result = await response.text();
+      const resultText = await response.text();
+      const resultJson = JSON.parse(resultText) as { count?: number; results?: WorkItemSearchResult[] };
+      const searchResults = resultJson.results ?? [];
+
+      // Extract work item IDs from search results and enrich with full details
+      const workItemIds = searchResults
+        .map((r) => {
+          const idField = r.fields?.["system.id"];
+          return idField ? parseInt(String(idField), 10) : NaN;
+        })
+        .filter((id) => !isNaN(id));
+
+      if (workItemIds.length > 0) {
+        const connection = await connectionProvider();
+        const witApi = await connection.getWorkItemTrackingApi();
+
+        // Batch in groups of 200 (Azure DevOps API limit)
+        const allWorkItems: WorkItem[] = [];
+        for (let i = 0; i < workItemIds.length; i += 200) {
+          const batch = workItemIds.slice(i, i + 200);
+          const items = await witApi.getWorkItems(batch, undefined, undefined, WorkItemExpand.All);
+          allWorkItems.push(...(items ?? []));
+        }
+
+        // Build a lookup map by ID
+        const workItemMap = new Map(allWorkItems.map((wi) => [wi.id, wi]));
+
+        // Build enriched response merging search metadata with full work item fields
+        const enrichedResults = searchResults.map((sr) => {
+          const id = parseInt(String(sr.fields?.["system.id"]), 10);
+          const fullItem = workItemMap.get(id);
+          return {
+            searchResult: sr,
+            workItem: fullItem?.fields ?? null,
+            relations: fullItem?.relations ?? [],
+          };
+        });
+
+        return {
+          content: [{ type: "text", text: JSON.stringify({ count: resultJson.count, results: enrichedResults }, null, 2) }],
+        };
+      }
+
       return {
-        content: [{ type: "text", text: result }],
+        content: [{ type: "text", text: resultText }],
       };
     }
   );
@@ -191,6 +234,11 @@ interface SearchResult {
   repository?: { id?: string };
   path?: string;
   versions?: { changeId?: string }[];
+  [key: string]: unknown;
+}
+
+interface WorkItemSearchResult {
+  fields?: Record<string, string>;
   [key: string]: unknown;
 }
 
