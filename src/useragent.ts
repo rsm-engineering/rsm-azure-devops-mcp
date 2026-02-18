@@ -1,5 +1,5 @@
-// Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// Copyright (c) RSM Engineering.
+// Based on Microsoft Corporation's azure-devops-mcp, licensed under MIT.
 
 interface McpClientInfo {
   name: string;
@@ -11,7 +11,7 @@ class UserAgentComposer {
   private _mcpClientInfoAppended: boolean;
 
   constructor(packageVersion: string) {
-    this._userAgent = `AzureDevOps.MCP/${packageVersion} (local)`;
+    this._userAgent = `RSM.AzureDevOps.MCP.Readonly/${packageVersion} (container)`;
     this._mcpClientInfoAppended = false;
   }
 
