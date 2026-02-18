@@ -43,7 +43,7 @@ Claude Desktop / MCP Clients
 |  | Per-Session MCP Server     |  |  Closures scoped to user creds
 |  +----------------------------+  |
 |                                  |
-|  /admin/users  (CRUD)            |  Admin registers users -> Key Vault
+|  /admin/users  (CRUD, AAD-only)  |  Admin registers users -> Key Vault
 |  /healthz, /readyz               |  Health probes
 +----------------+-----------------+
                  |
@@ -85,9 +85,9 @@ See [docs/TOOLSET.md](./docs/TOOLSET.md) for detailed parameter documentation pe
 
 ```bash
 # Set required env vars
-export ADMIN_API_KEY="your-admin-secret-key"
-export AAD_TENANT_ID="your-aad-tenant-id"        # or "placeholder" if not using AAD
-export AAD_CLIENT_ID="your-aad-app-client-id"     # or "placeholder" if not using AAD
+export AAD_TENANT_ID="your-aad-tenant-id"
+export AAD_CLIENT_ID="your-aad-app-client-id"
+export ADMIN_EMAILS="admin@example.com"           # Comma-separated admin emails
 export AZURE_SUBSCRIPTION_ID="your-subscription-id"
 
 # Run the deployment
@@ -98,9 +98,13 @@ This creates: Resource Group, ACR, Key Vault, Container App Environment, Contain
 
 ### Register a user
 
+Admin operations require an AAD Bearer token from an email in the `ADMIN_EMAILS` list:
+
 ```bash
+TOKEN=$(az account get-access-token --resource $AAD_CLIENT_ID --query accessToken -o tsv)
+
 curl -X POST https://<FQDN>/admin/users \
-  -H "x-api-key: $ADMIN_API_KEY" \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
     "email": "user@example.com",
@@ -146,15 +150,15 @@ The Container App uses these environment variables:
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `AZURE_KEYVAULT_URL` | Yes | Key Vault URL (e.g., `https://kv-rsm-ado-mcp.vault.azure.net/`) |
-| `ADMIN_API_KEY` | Yes | API key for admin endpoints (stored as a Container App secret) |
-| `AAD_TENANT_ID` | No | Azure AD tenant ID (required for AAD token auth) |
-| `AAD_CLIENT_ID` | No | Azure AD app registration client ID (required for AAD token auth) |
+| `AAD_TENANT_ID` | Yes | Azure AD tenant ID for authentication |
+| `AAD_CLIENT_ID` | Yes | Azure AD app registration client ID |
+| `ADMIN_EMAILS` | Yes | Comma-separated list of admin email addresses (AAD-authenticated) |
 | `PORT` | No | Server port (default: `3000`) |
 | `LOG_LEVEL` | No | Logging level: `error`, `warn`, `info`, `debug` (default: `info`) |
 
 ## User Management
 
-The admin API is protected by `ADMIN_API_KEY` (via `x-api-key` header).
+The admin API requires AAD authentication. Only users whose email appears in the `ADMIN_EMAILS` environment variable can access these endpoints (via `Authorization: Bearer <AAD-token>` header).
 
 | Method | Path | Description |
 |--------|------|-------------|

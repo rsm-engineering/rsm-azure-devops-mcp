@@ -92,7 +92,24 @@ curl -X POST https://<FQDN>/admin/users \
 
 **Symptom:** Admin endpoints (`/admin/users`) return 401.
 
-**Solution:** Ensure you're sending the correct `ADMIN_API_KEY` in the `x-api-key` header. This is the key set during deployment, not a user API key.
+**Solutions:**
+1. Admin endpoints require an AAD Bearer token (`Authorization: Bearer <token>`), not an `x-api-key` header.
+2. Obtain a token: `az account get-access-token --resource <AAD_CLIENT_ID> --query accessToken -o tsv`
+3. Ensure `AAD_TENANT_ID` and `AAD_CLIENT_ID` are configured on the container.
+
+### Admin API returns 403 — "User is not an authorized admin"
+
+**Symptom:** Admin endpoint returns 403 with a valid AAD token.
+
+**Solution:** Your email is not in the `ADMIN_EMAILS` environment variable. Update the container's `ADMIN_EMAILS` env var to include your AAD email address (comma-separated if multiple admins).
+
+### Admin API returns 503
+
+**Symptom:** Admin endpoints return 503 "not configured".
+
+**Solutions:**
+1. Ensure `ADMIN_EMAILS` is set on the container (comma-separated email addresses).
+2. Ensure `AAD_TENANT_ID` and `AAD_CLIENT_ID` are set (AAD authentication is required for admin access).
 
 ## Key Vault Issues
 

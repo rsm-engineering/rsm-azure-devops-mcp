@@ -9,22 +9,49 @@ import {
   listUsers,
   generateApiKey,
 } from "../auth/keyvault-store.js";
+import { validateAadToken, isAadConfigured } from "../auth/aad-validator.js";
 import type { UserConfig } from "../auth/types.js";
 
 // ---------------------------------------------------------------------------
-// Admin API key guard
+// Admin AAD auth guard — requires AAD Bearer token + email in ADMIN_EMAILS
 // ---------------------------------------------------------------------------
-const adminApiKey = process.env["ADMIN_API_KEY"];
+const adminEmails = new Set(
+  (process.env["ADMIN_EMAILS"] ?? "")
+    .split(",")
+    .map((e) => e.trim().toLowerCase())
+    .filter(Boolean),
+);
 
-function adminAuth(req: Request, res: Response, next: NextFunction): void {
-  if (!adminApiKey) {
-    res.status(503).json({ error: "Admin API not configured (ADMIN_API_KEY not set)." });
+async function adminAuth(req: Request, res: Response, next: NextFunction): Promise<void> {
+  if (adminEmails.size === 0) {
+    res.status(503).json({ error: "Admin API not configured (ADMIN_EMAILS not set)." });
     return;
   }
-  if (req.headers["x-api-key"] !== adminApiKey) {
-    res.status(401).json({ error: "Unauthorized." });
+  if (!isAadConfigured()) {
+    res.status(503).json({ error: "Admin API requires AAD authentication (AAD_TENANT_ID and AAD_CLIENT_ID not set)." });
     return;
   }
+
+  const authHeader = req.headers["authorization"];
+  if (!authHeader?.startsWith("Bearer ")) {
+    res.status(401).json({ error: "Admin access requires an AAD Bearer token in the Authorization header." });
+    return;
+  }
+
+  const token = authHeader.slice(7);
+  const user = await validateAadToken(token);
+  if (!user) {
+    res.status(401).json({ error: "Invalid or expired AAD token." });
+    return;
+  }
+
+  if (!adminEmails.has(user.email)) {
+    logger.warn("Admin access denied — user not in ADMIN_EMAILS", { email: user.email });
+    res.status(403).json({ error: "User is not an authorized admin." });
+    return;
+  }
+
+  logger.info("Admin authenticated via AAD", { email: user.email });
   next();
 }
 

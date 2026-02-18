@@ -110,7 +110,9 @@ export async function getUserByApiKey(apiKey: string): Promise<UserConfig | unde
       try {
         const config: UserConfig = JSON.parse(secret.value);
         cacheUser(config);
-        if (config.apiKey === apiKey) return config;
+        const a = Buffer.from(config.apiKey);
+        const b = Buffer.from(apiKey);
+        if (a.length === b.length && crypto.timingSafeEqual(a, b)) return config;
       } catch {
         // Skip malformed secrets
       }

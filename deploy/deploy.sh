@@ -7,13 +7,13 @@
 #          Key Vault Secrets Officer role to the Managed Identity.
 #
 # Required env vars (set before running):
-#   ADMIN_API_KEY           - API key for admin endpoints (/admin/*)
-#   AAD_TENANT_ID           - Azure AD tenant ID for user auth
+#   AAD_TENANT_ID           - Azure AD tenant ID for authentication
 #   AAD_CLIENT_ID           - Azure AD app registration client ID
+#   ADMIN_EMAILS            - Comma-separated admin email addresses
 #   AZURE_SUBSCRIPTION_ID   - Azure subscription ID
 #
 # Usage:
-#   ADMIN_API_KEY="..." AAD_TENANT_ID="..." AAD_CLIENT_ID="..." \
+#   AAD_TENANT_ID="..." AAD_CLIENT_ID="..." ADMIN_EMAILS="admin@co.com" \
 #     AZURE_SUBSCRIPTION_ID="..." bash deploy/deploy.sh
 #
 # Run from the repository root directory.
@@ -26,9 +26,9 @@ source "${SCRIPT_DIR}/config.sh"
 # ---------------------------------------------------------------------------
 # Validate required env vars
 # ---------------------------------------------------------------------------
-: "${ADMIN_API_KEY:?Set ADMIN_API_KEY before running this script}"
 : "${AAD_TENANT_ID:?Set AAD_TENANT_ID before running this script}"
 : "${AAD_CLIENT_ID:?Set AAD_CLIENT_ID before running this script}"
+: "${ADMIN_EMAILS:?Set ADMIN_EMAILS before running this script (comma-separated admin email addresses)}"
 : "${AZURE_SUBSCRIPTION_ID:?Set AZURE_SUBSCRIPTION_ID before running this script}"
 
 az account set --subscription "${AZURE_SUBSCRIPTION_ID}"
@@ -124,15 +124,13 @@ az containerapp create \
   --min-replicas "${MIN_REPLICAS}" \
   --max-replicas "${MAX_REPLICAS}" \
   --system-assigned \
-  --secrets \
-    "admin-api-key=${ADMIN_API_KEY}" \
   --env-vars \
     "PORT=${TARGET_PORT}" \
     "LOG_LEVEL=info" \
     "AZURE_KEYVAULT_URL=${KV_URL}" \
     "AAD_TENANT_ID=${AAD_TENANT_ID}" \
     "AAD_CLIENT_ID=${AAD_CLIENT_ID}" \
-    "ADMIN_API_KEY=secretref:admin-api-key" \
+    "ADMIN_EMAILS=${ADMIN_EMAILS}" \
   --output none 2>/dev/null || {
     echo "    Container App may already exist, updating..."
     az containerapp update \
@@ -145,7 +143,7 @@ az containerapp create \
         "AZURE_KEYVAULT_URL=${KV_URL}" \
         "AAD_TENANT_ID=${AAD_TENANT_ID}" \
         "AAD_CLIENT_ID=${AAD_CLIENT_ID}" \
-        "ADMIN_API_KEY=secretref:admin-api-key" \
+        "ADMIN_EMAILS=${ADMIN_EMAILS}" \
       --output none
   }
 
@@ -191,9 +189,12 @@ echo "  MCP endpoint:    https://${FQDN}/mcp"
 echo "  Health check:    https://${FQDN}/healthz"
 echo "  Admin API:       https://${FQDN}/admin/users"
 echo ""
-echo "  Register a user:"
+echo "  Admin emails:    ${ADMIN_EMAILS}"
+echo ""
+echo "  Register a user (requires AAD Bearer token from an admin email):"
+echo "    TOKEN=\$(az account get-access-token --resource ${AAD_CLIENT_ID} --query accessToken -o tsv)"
 echo "    curl -X POST https://${FQDN}/admin/users \\"
-echo "      -H 'x-api-key: <ADMIN_API_KEY>' \\"
+echo "      -H \"Authorization: Bearer \$TOKEN\" \\"
 echo "      -H 'Content-Type: application/json' \\"
 echo "      -d '{\"email\":\"user@example.com\",\"org\":\"MyOrg\",\"url\":\"https://dev.azure.com/MyOrg\",\"pat\":\"...\"}'"
 echo ""

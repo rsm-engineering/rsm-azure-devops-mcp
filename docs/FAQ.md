@@ -31,10 +31,12 @@ Yes, it is strictly read-only. There are no write operations exposed. You cannot
 
 ### How do users authenticate?
 
-Two methods are supported:
+Two methods are supported for **MCP clients** (`/mcp` endpoint):
 
 1. **API Key** (`x-api-key` header) — Generated when a user is registered via the admin API. Recommended for most MCP clients.
 2. **AAD/Entra ID JWT** (`Authorization: Bearer <token>`) — For enterprise SSO. Requires `AAD_TENANT_ID` and `AAD_CLIENT_ID` environment variables on the container.
+
+**Admin endpoints** (`/admin/*`) require AAD Bearer token authentication only. The admin user's email must be in the `ADMIN_EMAILS` environment variable.
 
 ### Are PATs used directly by clients?
 

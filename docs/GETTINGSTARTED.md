@@ -14,13 +14,13 @@ This guide walks through deploying the RSM Azure DevOps MCP Server and connectin
 ### Set environment variables
 
 ```bash
-export ADMIN_API_KEY="$(openssl rand -base64 32)"   # Generate a strong admin key
-export AAD_TENANT_ID="your-aad-tenant-id"           # Or "placeholder" if not using AAD auth
-export AAD_CLIENT_ID="your-aad-client-id"           # Or "placeholder" if not using AAD auth
+export AAD_TENANT_ID="your-aad-tenant-id"
+export AAD_CLIENT_ID="your-aad-client-id"
+export ADMIN_EMAILS="admin@example.com"              # Comma-separated admin email addresses
 export AZURE_SUBSCRIPTION_ID="your-subscription-id"
 ```
 
-Save `ADMIN_API_KEY` somewhere safe -- you'll need it to register users.
+The `ADMIN_EMAILS` list determines who can access the admin API. These must be AAD/Entra ID email addresses.
 
 ### Run the deployment script
 
@@ -65,7 +65,7 @@ MAX_REPLICAS=3
 
 ## 2. Register Users
 
-Each user needs an Azure DevOps org URL and PAT registered via the admin API.
+Each user needs an Azure DevOps org URL and PAT registered via the admin API. Admin operations require an AAD Bearer token from an email in the `ADMIN_EMAILS` list.
 
 ### Create a PAT
 
@@ -80,8 +80,11 @@ Each user needs an Azure DevOps org URL and PAT registered via the admin API.
 ### Register via admin API
 
 ```bash
+# Get an AAD token (must be logged in as an email in ADMIN_EMAILS)
+TOKEN=$(az account get-access-token --resource <AAD_CLIENT_ID> --query accessToken -o tsv)
+
 curl -X POST https://<FQDN>/admin/users \
-  -H "x-api-key: $ADMIN_API_KEY" \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
     "email": "user@example.com",
@@ -187,25 +190,31 @@ Once connected, try prompts like:
 
 ## 5. Managing Users
 
+All admin commands require an AAD Bearer token:
+
+```bash
+TOKEN=$(az account get-access-token --resource <AAD_CLIENT_ID> --query accessToken -o tsv)
+```
+
 ### List registered users
 
 ```bash
 curl https://<FQDN>/admin/users \
-  -H "x-api-key: $ADMIN_API_KEY"
+  -H "Authorization: Bearer $TOKEN"
 ```
 
 ### Remove a user
 
 ```bash
 curl -X DELETE https://<FQDN>/admin/users/user@example.com \
-  -H "x-api-key: $ADMIN_API_KEY"
+  -H "Authorization: Bearer $TOKEN"
 ```
 
 ### Rotate a user's API key
 
 ```bash
 curl -X POST https://<FQDN>/admin/users/user@example.com/rotate-key \
-  -H "x-api-key: $ADMIN_API_KEY"
+  -H "Authorization: Bearer $TOKEN"
 ```
 
 The old key stops working immediately. Provide the new key to the user.
